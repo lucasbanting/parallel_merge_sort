@@ -8,27 +8,31 @@
 #include <cassert>
 #include <climits>
 
+#define DISTRIBUTE_BUCKET 1
+
 void parallelRange(MPI_Comm comm, int commStart, int commStop, int &localStart, int &localStop)
 {
 	int rank, nproc;
 	int globalSize;
 	int localSize;
 	int localRemainder;
+	int offset;
 
 	MPI_Comm_rank(comm, &rank);
 	MPI_Comm_size(comm, &nproc);
 
 	globalSize = commStop - commStart;
-
 	localSize = globalSize / nproc;
-
 	localRemainder = globalSize % nproc;
 
-	if (localRemainder > rank)
-		localSize++;
+	if(rank < localRemainder)
+		offset = rank;
+	else
+		offset = localRemainder;
 
-	MPI_Scan(&localSize, &localStop, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-	localStart = localStop - localSize;
+	localStart = rank*localSize + offset;
+	localStop = localStart + localSize;
+	if(localRemainder > rank) localStop++;
 
 	localStart += commStart;
 	localStop += commStart;
@@ -131,7 +135,7 @@ void mergeArrays(MPI_Comm comm, std::vector<int> &array)
 	std::vector<int> copy(tomerge.size());
 	if (rank == 0)
 	{
-		std::cout << "merging result from " << nproc << " processes." << std::endl;
+		//std::cout << "merging result from " << nproc << " processes." << std::endl;
 		std::vector<int> starts(displs, displs + nproc);
 		std::vector<int> stops(nproc);
 
@@ -189,6 +193,184 @@ void parallelSort(MPI_Comm comm, std::vector<int> &array)
 	{
 		std::sort(array.begin(), array.end());
 	}
+}
+
+int binaryBucketSearch(std::vector<int> splitters, int low, int high, int val)
+{
+	int mid;
+	int bucket = -1;
+	while(low < high -1)
+	{	
+		mid = (low+high)/2;
+		
+		if(val < splitters[mid])
+		{
+			high = mid;
+		}	
+		else
+		{
+			low = mid;
+		}
+	}
+	
+	if( val <= splitters[mid])
+		bucket = mid-1;
+	else
+		bucket = mid;
+
+	return bucket;
+}
+
+//************************************************************************
+// use immediate sends and recieves to send correct bucket to each process
+//************************************************************************	
+void distributeBuckets(MPI_Comm comm, std::vector<std::vector<int>> buckets, std::vector<int> &array)
+{	
+	int rank, nproc;
+	
+	MPI_Comm_rank(comm, &rank);
+	MPI_Comm_size(comm, &nproc);
+
+	std::vector<MPI_Request> requests(2*nproc);
+	std::vector<int> recvcounts(nproc);
+	std::vector<int> recvdispls(nproc);
+	int totalRecv=0;
+
+	for(int ibucket=0; ibucket < buckets.size(); ibucket++)
+	{
+		MPI_Isend(&buckets[ibucket][0], buckets[ibucket].size(), MPI_INT, ibucket, DISTRIBUTE_BUCKET, comm, &requests[ibucket]);
+	}
+
+	for(int ibucket=0; ibucket < buckets.size(); ibucket++)
+	{
+		MPI_Status status;
+		MPI_Probe(ibucket, DISTRIBUTE_BUCKET, comm, &status);
+		MPI_Get_count(&status, MPI_INT, &recvcounts[ibucket]);
+	}
+
+	recvdispls[0]=0;
+	for(int ibucket=1; ibucket < buckets.size(); ibucket++)
+	{
+		recvdispls[ibucket] = recvdispls[ibucket-1] + recvcounts[ibucket-1];
+	}
+	totalRecv = recvcounts[nproc-1] + recvdispls[nproc-1];
+
+	array.resize(totalRecv);
+	for(int ibucket=0; ibucket < buckets.size(); ibucket++)
+	{
+		MPI_Irecv(&array[recvdispls[ibucket]], recvcounts[ibucket], MPI_INT, ibucket, DISTRIBUTE_BUCKET, comm, &requests[nproc + ibucket]);
+	}
+	
+	MPI_Waitall(requests.size(), &requests[0], MPI_STATUSES_IGNORE);
+}
+
+void sampleSort(MPI_Comm comm, std::vector<int> &array, int k)
+{
+	int rank, nproc;
+	int size;
+	std::vector<int> samples, allsamples, splitters;
+
+	MPI_Comm_rank(comm, &rank);
+	MPI_Comm_size(comm, &nproc);
+
+	//****************************
+	// sample array to find pivots
+	//****************************
+	size=array.size();
+	
+	for(int isample=0; isample < k; isample++)
+	{
+		samples.push_back(array[size*isample/k]);
+	}
+
+	allsamples.resize(nproc*k);
+	MPI_Allgather(&samples[0], k, MPI_INT, &allsamples[0], k, MPI_INT, comm);
+
+	//**********************************************
+	// pick evenly spaced pivots from sorted samples
+	//**********************************************
+	sort(allsamples.begin(), allsamples.end());
+
+	splitters.push_back(INT_MIN);
+	for(int isplitter=0; isplitter < nproc-1; isplitter++)
+	{
+		splitters.push_back(allsamples[k*isplitter + k]);
+	}
+	splitters.push_back(INT_MAX);
+	
+
+	//********************************
+	// place array values into buckets
+	//********************************
+	std::vector<std::vector<int>> buckets(nproc);
+	for(auto val : array)
+	{
+		int bucket = binaryBucketSearch(splitters, 0, splitters.size()-1, val);
+		buckets[bucket].push_back(val);
+	}
+
+	distributeBuckets(comm, buckets, array);
+	
+
+	//*********************
+	// sort the local array
+	//*********************
+	sort(array.begin(), array.end());
+
+
+	//*****************************
+	// redistribute/rebalance array
+	//*****************************
+	int totalSize = array.size();
+	int actualStart;
+	int localStart, localStop, localSize;
+	std::vector<int> localStarts(nproc);
+
+	MPI_Scan(&totalSize, &actualStart, 1, MPI_INT, MPI_SUM, comm);
+	actualStart -= totalSize;
+
+	MPI_Allreduce(MPI_IN_PLACE, &totalSize, 1, MPI_INT, MPI_SUM, comm);
+
+	parallelRange(comm, 0, totalSize, localStart, localStop);
+	localSize = localStop - localStart;
+
+	MPI_Allgather(&localStart, 1, MPI_INT, &localStarts[0], 1, MPI_INT, comm);
+	localStarts.push_back(INT_MAX);
+
+	for(int ibucket=0; ibucket < nproc; ibucket++)
+	{
+		buckets[ibucket].resize(0);
+	}
+
+	for(int ival=0; ival < array.size(); ival++)
+	{	
+		int low = 0;
+		int high = localStarts.size()-1;
+		int mid = -1;
+		int key = actualStart + ival;
+
+		while(low < high)
+		{
+			mid = (low + high)/2;
+			if(key >= localStarts[mid] && key < localStarts[mid+1])
+			{
+				break;
+			}
+			else if(key >= localStarts[mid])
+			{
+				low = mid;
+			}
+			else
+			{
+				high = mid;
+			}
+		}
+		buckets[mid].push_back(array[ival]);
+	}
+
+	
+	distributeBuckets(comm, buckets, array);
+
 }
 
 bool checkSorted(std::vector<int> array)
@@ -258,7 +440,24 @@ int main(int argc, char **argv)
 
 	if (rank == 0)
 	{
-		std::cout << "Time to sort: " << time << " s" << std::endl;
+		std::cout << "Time to merge-sort: " << time << " s" << std::endl;
+		std::cout << "Array is sorted: " << isSorted << std::endl;
+	}
+
+	// reset array
+	scatterArray(init, unsorted);
+
+
+	time = MPI_Wtime();
+	sampleSort(MPI_COMM_WORLD, unsorted, 64);
+
+	isSorted = checkSorted(unsorted);
+
+	time = MPI_Wtime() - time;
+
+	if (rank == 0)
+	{
+		std::cout << "Time to sample-sort: " << time << " s" << std::endl;
 		std::cout << "Array is sorted: " << isSorted << std::endl;
 	}
 
