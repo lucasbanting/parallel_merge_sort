@@ -52,7 +52,7 @@ void printArray(std::vector<int> array)
 	printArray(&array[0], array.size());
 }
 
-void scatterArray(std::vector<int> array, std::vector<int> &scattered)
+void scatterArray(const std::vector<int> &array, std::vector<int> &scattered)
 {
 	int rank, nproc;
 	int size = 0;
@@ -81,7 +81,7 @@ void scatterArray(std::vector<int> array, std::vector<int> &scattered)
 	MPI_Scatterv(&array[0], &sendcounts[0], &displs[0], MPI_INT, &scattered[0], localSize, MPI_INT, 0, MPI_COMM_WORLD);
 }
 
-void gatherArray(std::vector<int> array, std::vector<int> &gathered)
+void gatherArray(const std::vector<int> &array, std::vector<int> &gathered)
 {
 	int rank, nproc;
 	int size = 0;
@@ -195,7 +195,7 @@ void parallelSort(MPI_Comm comm, std::vector<int> &array)
 	}
 }
 
-int binaryBucketSearch(std::vector<int> splitters, int low, int high, int val)
+int binaryBucketSearch(const std::vector<int> &splitters, int low, int high, int val)
 {
 	int mid;
 	int bucket = -1;
@@ -224,7 +224,7 @@ int binaryBucketSearch(std::vector<int> splitters, int low, int high, int val)
 //************************************************************************
 // use immediate sends and recieves to send correct bucket to each process
 //************************************************************************	
-void distributeBuckets(MPI_Comm comm, std::vector<std::vector<int>> buckets, std::vector<int> &array)
+void distributeBuckets(MPI_Comm comm, const std::vector<std::vector<int>> &buckets, std::vector<int> &array)
 {	
 	int rank, nproc;
 	
@@ -373,7 +373,7 @@ void sampleSort(MPI_Comm comm, std::vector<int> &array, int k)
 
 }
 
-bool checkSorted(std::vector<int> array)
+bool checkSorted(const std::vector<int> &array)
 {
 	bool result = true;
 	int rank, nproc;
@@ -416,6 +416,10 @@ int main(int argc, char **argv)
 	MPI_Init(&argc, &argv);
 	MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	if (argc != 2) {
+		std::cout << "./main.out N -- where N is the size of the global array to sort" << std::endl;
+		std::exit(1);
+	}
 
 	arraySize = atoi(argv[1]);
 
